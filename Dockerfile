@@ -111,17 +111,11 @@ ENV PATH="/opt/cartesi/bin:/opt/cartesi/dapp:${PATH}"
 WORKDIR /opt/cartesi/dapp
 COPY --from=cross-build-stage /opt/cartesi/dapp/target/riscv64gc-unknown-linux-gnu/release/dapp .
 
-ENV ROLLUP_HTTP_SERVER_URL="http://127.0.0.1:5004"
+# .env is the single source of truth for portal addresses.
+# The app reads and applies it at startup before reading env vars.
+COPY .env .
 
-# Portal addresses — sourced exclusively from .env.
-# Before building, export the values:
-#   export $(grep -v '^#' .env | xargs) && cartesi build
-ARG ERC20_PORTAL_ADDRESS
-ARG ERC721_PORTAL_ADDRESS
-ARG ERC1155_PORTAL_ADDRESS
-ENV ERC20_PORTAL_ADDRESS=${ERC20_PORTAL_ADDRESS} \
-    ERC721_PORTAL_ADDRESS=${ERC721_PORTAL_ADDRESS} \
-    ERC1155_PORTAL_ADDRESS=${ERC1155_PORTAL_ADDRESS}
+ENV ROLLUP_HTTP_SERVER_URL="http://127.0.0.1:5004"
 
 ENTRYPOINT ["rollup-init"]
 CMD ["dapp"]

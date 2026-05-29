@@ -3,9 +3,33 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::{Mutex, OnceLock};
 
-// Portal addresses are loaded exclusively from environment variables.
-// Set them in .env (baked into the Cartesi Machine image via Dockerfile ARG/ENV).
-// See .env for the canonical v2.2.0 values and override instructions.
+// ── .env loader ──────────────────────────────────────────────────────────────
+// Reads KEY=VALUE pairs from `.env` in the working directory and sets any that
+// are not already present in the process environment.  Called once at startup
+// before AppState is initialised, so portal addresses defined in .env are
+// available via env::var() with no Dockerfile duplication.
+// .env is copied into the machine image by the Dockerfile (COPY .env .).
+
+fn load_dotenv() {
+    let content = match std::fs::read_to_string(".env") {
+        Ok(c) => c,
+        Err(_) => return, // no .env present — rely on existing env vars
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let key = key.trim();
+            let val = val.trim();
+            // Existing env vars take precedence over .env values.
+            if env::var(key).is_err() {
+                env::set_var(key, val);
+            }
+        }
+    }
+}
 
 // ── ABI selectors (keccak256 of signature, first 4 bytes) ────────────────────
 // transfer(address,uint256)
@@ -992,8 +1016,24 @@ pub async fn handle_inspect(
             "erc1155_withdrawals"=> erc1155_wths,
         }.dump()
 
+    } else if route == "app" {
+        let s = get_state().lock().unwrap();
+        match &s.app_contract {
+            Some(addr) => object!{
+                "route"        => "app",
+                "app_contract" => addr.clone(),
+                "discovered"   => true,
+            }.dump(),
+            None => object!{
+                "route"        => "app",
+                "app_contract" => json::JsonValue::Null,
+                "discovered"   => false,
+                "hint"         => "no advance input processed yet",
+            }.dump(),
+        }
+
     } else {
-        format!(r#"{{"error":"unknown_route","route":"{}","valid":["all","student/<addr>","activity/<addr>","portals","summary"]}}"#, route)
+        format!(r#"{{"error":"unknown_route","route":"{}","valid":["all","student/<addr>","activity/<addr>","portals","app","summary"]}}"#, route)
     };
 
     log("INSPECT", &format!("event=inspect_response route={} response_len={}", route, report.len()));
@@ -1007,6 +1047,9 @@ pub async fn handle_inspect(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env before anything else so portal addresses are available.
+    load_dotenv();
+
     let client = hyper::Client::new();
     let server_addr = env::var("ROLLUP_HTTP_SERVER_URL")?;
 
