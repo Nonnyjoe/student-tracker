@@ -3,10 +3,9 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::{Mutex, OnceLock};
 
-// ── Portal addresses (v2.2.0, CREATE2-deterministic, same on all EVM chains) ──
-const DEFAULT_ERC20_PORTAL: &str  = "0xaca6586a0cf05bd831f2501e7b4aea550da6562d";
-const DEFAULT_ERC721_PORTAL: &str = "0x9e8851dadb2b77103928518846c4678d48b5e371";
-const DEFAULT_ERC1155_PORTAL: &str = "0x18558398dd1a8ce20956287a4da7b76ae7a96662";
+// Portal addresses are loaded exclusively from environment variables.
+// Set them in .env (baked into the Cartesi Machine image via Dockerfile ARG/ENV).
+// See .env for the canonical v2.2.0 values and override instructions.
 
 // ── ABI selectors (keccak256 of signature, first 4 bytes) ────────────────────
 // transfer(address,uint256)
@@ -197,24 +196,25 @@ struct AppState {
     erc20_portal:   String,
     erc721_portal:  String,
     erc1155_portal: String,
-    /// Application contract address (self). Learned from advance metadata
-    /// or env var APP_CONTRACT_ADDRESS. Required for ERC-721/1155 vouchers.
+    /// Application contract address (self). Self-discovered from
+    /// metadata.app_contract on the first advance input received.
     app_contract:   Option<String>,
 }
 
 impl AppState {
     fn new() -> Self {
         let erc20 = env::var("ERC20_PORTAL_ADDRESS")
-            .unwrap_or_else(|_| DEFAULT_ERC20_PORTAL.to_string()).to_lowercase();
+            .expect("ERC20_PORTAL_ADDRESS not set — add it to .env and rebuild")
+            .to_lowercase();
         let erc721 = env::var("ERC721_PORTAL_ADDRESS")
-            .unwrap_or_else(|_| DEFAULT_ERC721_PORTAL.to_string()).to_lowercase();
+            .expect("ERC721_PORTAL_ADDRESS not set — add it to .env and rebuild")
+            .to_lowercase();
         let erc1155 = env::var("ERC1155_PORTAL_ADDRESS")
-            .unwrap_or_else(|_| DEFAULT_ERC1155_PORTAL.to_string()).to_lowercase();
-        let app_contract = env::var("APP_CONTRACT_ADDRESS").ok().map(|s| s.to_lowercase());
-
+            .expect("ERC1155_PORTAL_ADDRESS not set — add it to .env and rebuild")
+            .to_lowercase();
         log("INIT", &format!(
-            "event=startup erc20_portal={} erc721_portal={} erc1155_portal={} app_contract={:?}",
-            erc20, erc721, erc1155, app_contract
+            "event=startup erc20_portal={} erc721_portal={} erc1155_portal={}",
+            erc20, erc721, erc1155
         ));
 
         Self {
@@ -222,7 +222,7 @@ impl AppState {
             erc20_portal: erc20,
             erc721_portal: erc721,
             erc1155_portal: erc1155,
-            app_contract,
+            app_contract: None,
         }
     }
 }
@@ -775,7 +775,7 @@ pub async fn handle_advance(
                     if app_addr.is_empty() {
                         log("ERROR", &format!("event=app_contract_unknown input_index={}", input_index));
                         emit_report(client, server_addr, &format!(
-                            r#"{{"error":"app_contract_unknown","hint":"set APP_CONTRACT_ADDRESS env or send any advance first","input_index":{}}}"#,
+                            r#"{{"error":"app_contract_unknown","hint":"app address is self-discovered — ensure at least one advance input was processed before withdrawing","input_index":{}}}"#,
                             input_index
                         )).await?;
                         return Ok("reject");

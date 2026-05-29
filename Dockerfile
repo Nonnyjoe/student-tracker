@@ -113,5 +113,15 @@ COPY --from=cross-build-stage /opt/cartesi/dapp/target/riscv64gc-unknown-linux-g
 
 ENV ROLLUP_HTTP_SERVER_URL="http://127.0.0.1:5004"
 
+# Portal addresses — sourced exclusively from .env.
+# Before building, export the values:
+#   export $(grep -v '^#' .env | xargs) && cartesi build
+ARG ERC20_PORTAL_ADDRESS
+ARG ERC721_PORTAL_ADDRESS
+ARG ERC1155_PORTAL_ADDRESS
+ENV ERC20_PORTAL_ADDRESS=${ERC20_PORTAL_ADDRESS} \
+    ERC721_PORTAL_ADDRESS=${ERC721_PORTAL_ADDRESS} \
+    ERC1155_PORTAL_ADDRESS=${ERC1155_PORTAL_ADDRESS}
+
 ENTRYPOINT ["rollup-init"]
 CMD ["dapp"]
