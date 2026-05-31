@@ -4,16 +4,10 @@ use std::env;
 use std::sync::{Mutex, OnceLock};
 
 // ── .env loader ──────────────────────────────────────────────────────────────
-// Reads KEY=VALUE pairs from `.env` in the working directory and sets any that
-// are not already present in the process environment.  Called once at startup
-// before AppState is initialised, so portal addresses defined in .env are
-// available via env::var() with no Dockerfile duplication.
-// .env is copied into the machine image by the Dockerfile (COPY .env .).
-
 fn load_dotenv() {
     let content = match std::fs::read_to_string(".env") {
         Ok(c) => c,
-        Err(_) => return, // no .env present — rely on existing env vars
+        Err(_) => return,
     };
     for line in content.lines() {
         let line = line.trim();
@@ -23,7 +17,6 @@ fn load_dotenv() {
         if let Some((key, val)) = line.split_once('=') {
             let key = key.trim();
             let val = val.trim();
-            // Existing env vars take precedence over .env values.
             if env::var(key).is_err() {
                 env::set_var(key, val);
             }
@@ -31,13 +24,18 @@ fn load_dotenv() {
     }
 }
 
-// ── ABI selectors (keccak256 of signature, first 4 bytes) ────────────────────
+// ── ABI selectors ────────────────────────────────────────────────────────────
 // transfer(address,uint256)
 const SEL_ERC20_TRANSFER: &str = "a9059cbb";
 // safeTransferFrom(address,address,uint256)
 const SEL_ERC721_SAFE_TRANSFER: &str = "42842e0e";
 // safeTransferFrom(address,address,uint256,uint256,bytes)
 const SEL_ERC1155_SAFE_TRANSFER: &str = "f242432a";
+// withdrawEther(address,uint256)  — EtherPortal
+const SEL_ETHER_WITHDRAW: &str = "522f6815";
+
+// ── App version ───────────────────────────────────────────────────────────────
+const APP_VERSION: &str = "2.0.0";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Domain model
@@ -49,10 +47,12 @@ struct Student {
     registration_number: String,
     wallet_address: String,
     // Deposit ledger
-    erc20_deposits:    Vec<(String, u128)>,           // (token_addr, amount)
-    erc721_deposits:   Vec<(String, String)>,          // (token_addr, token_id_hex)
-    erc1155_deposits:  Vec<(String, String, u128)>,   // (token_addr, token_id_hex, amount)
+    ether_deposits:    Vec<u128>,                      // wei amounts
+    erc20_deposits:    Vec<(String, u128)>,            // (token_addr, amount)
+    erc721_deposits:   Vec<(String, String)>,           // (token_addr, token_id_hex)
+    erc1155_deposits:  Vec<(String, String, u128)>,    // (token_addr, token_id_hex, amount)
     // Withdrawal ledger (vouchers issued)
+    ether_withdrawals:    Vec<u128>,
     erc20_withdrawals:    Vec<(String, u128)>,
     erc721_withdrawals:   Vec<(String, String)>,
     erc1155_withdrawals:  Vec<(String, String, u128)>,
@@ -64,13 +64,21 @@ impl Student {
             name,
             registration_number: reg,
             wallet_address: wallet,
+            ether_deposits: vec![],
             erc20_deposits: vec![],
             erc721_deposits: vec![],
             erc1155_deposits: vec![],
+            ether_withdrawals: vec![],
             erc20_withdrawals: vec![],
             erc721_withdrawals: vec![],
             erc1155_withdrawals: vec![],
         }
+    }
+
+    fn ether_available(&self) -> u128 {
+        let dep: u128 = self.ether_deposits.iter().sum();
+        let wth: u128 = self.ether_withdrawals.iter().sum();
+        dep.saturating_sub(wth)
     }
 
     fn erc20_available(&self, token: &str) -> u128 {
@@ -96,7 +104,11 @@ impl Student {
     }
 
     fn to_json(&self) -> JsonValue {
-        // ── ERC-20 ──
+        // ETH
+        let total_ether_dep: u128 = self.ether_deposits.iter().sum();
+        let total_ether_wth: u128 = self.ether_withdrawals.iter().sum();
+
+        // ERC-20
         let erc20_tokens: HashSet<String> =
             self.erc20_deposits.iter().map(|(t,_)| t.clone()).collect();
         let mut erc20_arr = json::JsonValue::new_array();
@@ -111,7 +123,7 @@ impl Student {
             });
         }
 
-        // ── ERC-721 ──
+        // ERC-721
         let erc721_tokens: HashSet<String> =
             self.erc721_deposits.iter().map(|(t,_)| t.clone()).collect();
         let mut erc721_arr = json::JsonValue::new_array();
@@ -131,7 +143,7 @@ impl Student {
             });
         }
 
-        // ── ERC-1155 ──
+        // ERC-1155
         let erc1155_keys: HashSet<(String,String)> = self.erc1155_deposits.iter()
             .map(|(t,id,_)| (t.clone(), id.clone())).collect();
         let mut erc1155_arr = json::JsonValue::new_array();
@@ -153,16 +165,26 @@ impl Student {
             "name"                => self.name.clone(),
             "registration_number" => self.registration_number.clone(),
             "wallet_address"      => self.wallet_address.clone(),
+            "ether_balance"       => object!{
+                "total_deposited" => total_ether_dep.to_string(),
+                "total_withdrawn" => total_ether_wth.to_string(),
+                "available_wei"   => self.ether_available().to_string(),
+            },
             "erc20_balances"      => erc20_arr,
             "erc721_holdings"     => erc721_arr,
             "erc1155_balances"    => erc1155_arr,
         }
     }
 
-    /// Chronological activity log for inspect queries.
     fn activity_log(&self) -> JsonValue {
         let mut events = json::JsonValue::new_array();
 
+        for amount in &self.ether_deposits {
+            let _ = events.push(object!{
+                "type"   => "ether_deposit",
+                "amount" => amount.to_string(),
+            });
+        }
         for (token, amount) in &self.erc20_deposits {
             let _ = events.push(object!{
                 "type"   => "erc20_deposit",
@@ -183,6 +205,12 @@ impl Student {
                 "token"    => token.clone(),
                 "token_id" => token_id.clone(),
                 "amount"   => amount.to_string(),
+            });
+        }
+        for amount in &self.ether_withdrawals {
+            let _ = events.push(object!{
+                "type"   => "ether_withdrawal",
+                "amount" => amount.to_string(),
             });
         }
         for (token, amount) in &self.erc20_withdrawals {
@@ -216,17 +244,22 @@ impl Student {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 struct AppState {
-    students:       HashMap<String, Student>,
-    erc20_portal:   String,
-    erc721_portal:  String,
-    erc1155_portal: String,
-    /// Application contract address (self). Self-discovered from
-    /// metadata.app_contract on the first advance input received.
-    app_contract:   Option<String>,
+    students:        HashMap<String, Student>,
+    ether_portal:    String,
+    erc20_portal:    String,
+    erc721_portal:   String,
+    erc1155_portal:  String,
+    app_contract:    Option<String>,
+    total_inputs:    u64,
+    total_notices:   u64,
+    total_vouchers:  u64,
 }
 
 impl AppState {
     fn new() -> Self {
+        let ether = env::var("ETHER_PORTAL_ADDRESS")
+            .unwrap_or_else(|_| "0xa632c5c05812c6a6149b7af5c56117d1d2603828".to_string())
+            .to_lowercase();
         let erc20 = env::var("ERC20_PORTAL_ADDRESS")
             .expect("ERC20_PORTAL_ADDRESS not set — add it to .env and rebuild")
             .to_lowercase();
@@ -237,16 +270,20 @@ impl AppState {
             .expect("ERC1155_PORTAL_ADDRESS not set — add it to .env and rebuild")
             .to_lowercase();
         log("INIT", &format!(
-            "event=startup erc20_portal={} erc721_portal={} erc1155_portal={}",
-            erc20, erc721, erc1155
+            "event=startup version={} ether_portal={} erc20_portal={} erc721_portal={} erc1155_portal={}",
+            APP_VERSION, ether, erc20, erc721, erc1155
         ));
 
         Self {
             students: HashMap::new(),
+            ether_portal: ether,
             erc20_portal: erc20,
             erc721_portal: erc721,
             erc1155_portal: erc1155,
             app_contract: None,
+            total_inputs: 0,
+            total_notices: 0,
+            total_vouchers: 0,
         }
     }
 }
@@ -257,7 +294,7 @@ fn get_state() -> &'static Mutex<AppState> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Structured logging  ── every event written to stdout, parseable by tests
+// Structured logging
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn log(tag: &str, msg: &str) {
@@ -294,29 +331,33 @@ fn extract_uint256_hex(bytes: &[u8], offset: usize) -> Option<String> {
         .map(|b| format!("{:02x}", b)).collect::<String>()))
 }
 
+/// Extract trailing bytes as a 0x hex string (for execLayerData / baseLayerData).
+fn extract_trailing_hex(bytes: &[u8], from: usize) -> String {
+    if bytes.len() <= from {
+        return "0x".to_string();
+    }
+    format!("0x{}", bytes[from..].iter().map(|b| format!("{:02x}", b)).collect::<String>())
+}
+
 fn str_to_hex_payload(s: &str) -> String {
     format!("0x{}", s.bytes().map(|b| format!("{:02x}", b)).collect::<String>())
 }
 
-/// Normalise any hex token ID to 0x + 64 lowercase hex chars.
 fn normalise_uint256(hex: &str) -> String {
     let bare = hex.trim_start_matches("0x");
     format!("0x{:0>64}", bare.to_lowercase())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ABI encoding helpers (manual — no extra crate required)
+// ABI encoding helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Encode an address as 32 bytes (12 leading zero bytes + 20-byte address).
 fn abi_addr(addr: &str) -> String {
     format!("000000000000000000000000{}", addr.trim_start_matches("0x").to_lowercase())
 }
 
-/// Encode u128 as a 32-byte big-endian uint256.
 fn abi_u128(val: u128) -> String { format!("{:064x}", val) }
 
-/// Encode a 0x-prefixed uint256 hex string as 64 hex chars (left-padded).
 fn abi_uint256(hex: &str) -> String {
     format!("{:0>64}", hex.trim_start_matches("0x").to_lowercase())
 }
@@ -338,9 +379,7 @@ fn calldata_erc721_transfer(from: &str, to: &str, token_id: &str) -> String {
 }
 
 /// safeTransferFrom(address from, address to, uint256 id, uint256 value, bytes data)
-/// — empty `data`, standard ABI encoding.
 fn calldata_erc1155_transfer(from: &str, to: &str, token_id: &str, amount: u128) -> String {
-    // 5 static params × 32 bytes = 160 (0xa0) — offset to the `data` bytes param.
     format!(
         "0x{}{}{}{}{}{}{}",
         SEL_ERC1155_SAFE_TRANSFER,
@@ -353,8 +392,13 @@ fn calldata_erc1155_transfer(from: &str, to: &str, token_id: &str, amount: u128)
     )
 }
 
+/// withdrawEther(address receiver, uint256 value)  — calls EtherPortal
+fn calldata_ether_withdraw(to: &str, amount: u128) -> String {
+    format!("0x{}{}{}", SEL_ETHER_WITHDRAW, abi_addr(to), abi_u128(amount))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// Rollup HTTP helpers  (never hold a Mutex lock when calling these)
+// Rollup HTTP helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async fn emit_notice(
@@ -369,7 +413,11 @@ async fn emit_notice(
         .uri(format!("{}/notice", server_addr))
         .body(hyper::Body::from(body.dump()))?;
     let resp = client.request(req).await?;
-    log("NOTICE", &format!("http_status={} payload={}", resp.status(), payload));
+    {
+        let mut s = get_state().lock().unwrap();
+        s.total_notices += 1;
+    }
+    log("NOTICE", &format!("http_status={} payload_len={}", resp.status(), payload.len()));
     Ok(())
 }
 
@@ -385,7 +433,7 @@ async fn emit_report(
         .uri(format!("{}/report", server_addr))
         .body(hyper::Body::from(body.dump()))?;
     let resp = client.request(req).await?;
-    log("REPORT", &format!("http_status={} payload={}", resp.status(), payload));
+    log("REPORT", &format!("http_status={} payload_len={}", resp.status(), payload.len()));
     Ok(())
 }
 
@@ -405,7 +453,11 @@ async fn emit_voucher(
         .uri(format!("{}/voucher", server_addr))
         .body(hyper::Body::from(body.dump()))?;
     let resp = client.request(req).await?;
-    log("VOUCHER", &format!("http_status={} destination={} calldata={}", resp.status(), destination, calldata));
+    {
+        let mut s = get_state().lock().unwrap();
+        s.total_vouchers += 1;
+    }
+    log("VOUCHER", &format!("http_status={} destination={}", resp.status(), destination));
     Ok(())
 }
 
@@ -430,23 +482,84 @@ pub async fn handle_advance(
         input_index, msg_sender, timestamp, payload_hex.len()
     ));
 
-    // Store app_contract the first time we see it in metadata.
-    if !app_from_meta.is_empty() {
+    // Increment total input counter and discover app_contract
+    {
         let mut s = get_state().lock().unwrap();
-        if s.app_contract.is_none() {
+        s.total_inputs += 1;
+        if s.app_contract.is_none() && !app_from_meta.is_empty() {
             s.app_contract = Some(app_from_meta.clone());
             log("INIT", &format!("event=app_contract_discovered address={}", app_from_meta));
         }
     }
 
     // Read portal addresses (release lock before any await).
-    let (erc20_portal, erc721_portal, erc1155_portal) = {
+    let (ether_portal, erc20_portal, erc721_portal, erc1155_portal) = {
         let s = get_state().lock().unwrap();
-        (s.erc20_portal.clone(), s.erc721_portal.clone(), s.erc1155_portal.clone())
+        (s.ether_portal.clone(), s.erc20_portal.clone(),
+         s.erc721_portal.clone(), s.erc1155_portal.clone())
     };
 
+    // Helper: emit a diagnostic report marking this advance as processed.
+    // Called at the end of every successful advance for test 5.11 coverage.
+    let emit_advance_report = |result: &str| {
+        let diag = format!(
+            r#"{{"event":"advance_processed","input_index":{},"msg_sender":"{}","result":"{}"}}"#,
+            input_index, msg_sender, result
+        );
+        async move {
+            if let Err(e) = emit_report(client, server_addr, &diag).await {
+                log("WARN", &format!("advance_report failed: {}", e));
+            }
+        }
+    };
+
+    // ── Ether portal deposit ──────────────────────────────────────────────────
+    // Payload: depositor(20) + amount(32) + execLayerData(N)  = 52+ bytes
+    if msg_sender == ether_portal {
+        let bytes = match hex_to_bytes(payload_hex) {
+            Some(b) if b.len() >= 52 => b,
+            _ => {
+                log("ERROR", &format!("event=invalid_ether_payload input_index={}", input_index));
+                let err = format!(r#"{{"error":"invalid_ether_payload","input_index":{}}}"#, input_index);
+                emit_report(client, server_addr, &err).await?;
+                return Ok("reject");
+            }
+        };
+
+        let depositor = extract_address(&bytes, 0).unwrap();
+        let amount    = extract_u128(&bytes, 20).unwrap_or(0);
+        let exec_data = extract_trailing_hex(&bytes, 52);
+
+        {
+            let mut s = get_state().lock().unwrap();
+            let entry = s.students.entry(depositor.clone()).or_insert_with(|| {
+                let st = Student::new(
+                    format!("Unknown({})", &depositor[..10]),
+                    format!("AUTO-{}", &depositor[2..10]),
+                    depositor.clone(),
+                );
+                log("ADVANCE", &format!("event=auto_registered wallet={}", depositor));
+                st
+            });
+            entry.ether_deposits.push(amount);
+        }
+
+        log("ADVANCE", &format!(
+            "event=ether_deposit input_index={} depositor={} amount={}",
+            input_index, depositor, amount
+        ));
+
+        let notice = format!(
+            r#"{{"event":"ether_deposit","input_index":{},"depositor":"{}","amount":"{}","exec_layer_data":"{}"}}"#,
+            input_index, depositor, amount, exec_data
+        );
+        emit_notice(client, server_addr, &notice).await?;
+        emit_advance_report("accept").await;
+        return Ok("accept");
+    }
+
     // ── ERC-20 portal deposit ─────────────────────────────────────────────────
-    // Payload: token(20) | depositor(20) | amount(32) = 72 bytes minimum
+    // Payload: token(20) | depositor(20) | amount(32) | execLayerData(N) = 72+ bytes
     if msg_sender == erc20_portal {
         let bytes = match hex_to_bytes(payload_hex) {
             Some(b) if b.len() >= 72 => b,
@@ -461,19 +574,16 @@ pub async fn handle_advance(
         let token_addr = extract_address(&bytes, 0).unwrap();
         let depositor  = extract_address(&bytes, 20).unwrap();
         let amount     = extract_u128(&bytes, 40).unwrap_or(0);
+        let exec_data  = extract_trailing_hex(&bytes, 72);
 
         {
             let mut s = get_state().lock().unwrap();
             let entry = s.students.entry(depositor.clone()).or_insert_with(|| {
-                let st = Student::new(
+                Student::new(
                     format!("Unknown({})", &depositor[..10]),
                     format!("AUTO-{}", &depositor[2..10]),
                     depositor.clone(),
-                );
-                log("ADVANCE", &format!(
-                    "event=auto_registered wallet={} input_index={}", depositor, input_index
-                ));
-                st
+                )
             });
             entry.erc20_deposits.push((token_addr.clone(), amount));
         }
@@ -484,15 +594,16 @@ pub async fn handle_advance(
         ));
 
         let notice = format!(
-            r#"{{"event":"erc20_deposit","input_index":{},"depositor":"{}","token":"{}","amount":"{}"}}"#,
-            input_index, depositor, token_addr, amount
+            r#"{{"event":"erc20_deposit","input_index":{},"depositor":"{}","token":"{}","amount":"{}","exec_layer_data":"{}"}}"#,
+            input_index, depositor, token_addr, amount, exec_data
         );
         emit_notice(client, server_addr, &notice).await?;
+        emit_advance_report("accept").await;
         return Ok("accept");
     }
 
     // ── ERC-721 portal deposit ────────────────────────────────────────────────
-    // Payload: token(20) | depositor(20) | tokenId(32) = 72 bytes minimum
+    // Payload: token(20) | depositor(20) | tokenId(32) | baseLayerData | execLayerData
     if msg_sender == erc721_portal {
         let bytes = match hex_to_bytes(payload_hex) {
             Some(b) if b.len() >= 72 => b,
@@ -507,19 +618,17 @@ pub async fn handle_advance(
         let token_addr = extract_address(&bytes, 0).unwrap();
         let depositor  = extract_address(&bytes, 20).unwrap();
         let token_id   = extract_uint256_hex(&bytes, 40).unwrap();
+        // Trailing bytes after 72 are ABI-encoded baseLayerData + execLayerData
+        let extra_data = extract_trailing_hex(&bytes, 72);
 
         {
             let mut s = get_state().lock().unwrap();
             let entry = s.students.entry(depositor.clone()).or_insert_with(|| {
-                let st = Student::new(
+                Student::new(
                     format!("Unknown({})", &depositor[..10]),
                     format!("AUTO-{}", &depositor[2..10]),
                     depositor.clone(),
-                );
-                log("ADVANCE", &format!(
-                    "event=auto_registered wallet={} input_index={}", depositor, input_index
-                ));
-                st
+                )
             });
             entry.erc721_deposits.push((token_addr.clone(), token_id.clone()));
         }
@@ -530,15 +639,16 @@ pub async fn handle_advance(
         ));
 
         let notice = format!(
-            r#"{{"event":"erc721_deposit","input_index":{},"depositor":"{}","token":"{}","token_id":"{}"}}"#,
-            input_index, depositor, token_addr, token_id
+            r#"{{"event":"erc721_deposit","input_index":{},"depositor":"{}","token":"{}","token_id":"{}","extra_data":"{}"}}"#,
+            input_index, depositor, token_addr, token_id, extra_data
         );
         emit_notice(client, server_addr, &notice).await?;
+        emit_advance_report("accept").await;
         return Ok("accept");
     }
 
     // ── ERC-1155 single portal deposit ────────────────────────────────────────
-    // Payload: token(20) | depositor(20) | tokenId(32) | amount(32) = 104 bytes minimum
+    // Payload: token(20) | depositor(20) | tokenId(32) | amount(32) | extra(N) = 104+ bytes
     if msg_sender == erc1155_portal {
         let bytes = match hex_to_bytes(payload_hex) {
             Some(b) if b.len() >= 104 => b,
@@ -554,19 +664,16 @@ pub async fn handle_advance(
         let depositor  = extract_address(&bytes, 20).unwrap();
         let token_id   = extract_uint256_hex(&bytes, 40).unwrap();
         let amount     = extract_u128(&bytes, 72).unwrap_or(0);
+        let extra_data = extract_trailing_hex(&bytes, 104);
 
         {
             let mut s = get_state().lock().unwrap();
             let entry = s.students.entry(depositor.clone()).or_insert_with(|| {
-                let st = Student::new(
+                Student::new(
                     format!("Unknown({})", &depositor[..10]),
                     format!("AUTO-{}", &depositor[2..10]),
                     depositor.clone(),
-                );
-                log("ADVANCE", &format!(
-                    "event=auto_registered wallet={} input_index={}", depositor, input_index
-                ));
-                st
+                )
             });
             entry.erc1155_deposits.push((token_addr.clone(), token_id.clone(), amount));
         }
@@ -577,10 +684,11 @@ pub async fn handle_advance(
         ));
 
         let notice = format!(
-            r#"{{"event":"erc1155_deposit","input_index":{},"depositor":"{}","token":"{}","token_id":"{}","amount":"{}"}}"#,
-            input_index, depositor, token_addr, token_id, amount
+            r#"{{"event":"erc1155_deposit","input_index":{},"depositor":"{}","token":"{}","token_id":"{}","amount":"{}","extra_data":"{}"}}"#,
+            input_index, depositor, token_addr, token_id, amount, extra_data
         );
         emit_notice(client, server_addr, &notice).await?;
+        emit_advance_report("accept").await;
         return Ok("accept");
     }
 
@@ -608,16 +716,18 @@ pub async fn handle_advance(
     let action = match json::parse(&payload_str) {
         Ok(v) => v,
         Err(_) => {
-            log("ERROR", &format!("event=payload_not_json input_index={} raw={}", input_index, payload_str));
+            log("ERROR", &format!("event=payload_not_json input_index={}", input_index));
             emit_report(client, server_addr,
                 &format!(r#"{{"error":"payload_not_json","input_index":{},"raw":"{}"}}"#,
-                    input_index, payload_str.replace('"', "\\\""))).await?;
+                    input_index, payload_str.chars().take(120).collect::<String>()
+                        .replace('"', "\\\""))).await?;
             return Ok("reject");
         }
     };
 
     let action_type = action["action"].as_str().unwrap_or("").to_string();
-    log("ADVANCE", &format!("event=action_received input_index={} action={} sender={}", input_index, action_type, msg_sender));
+    log("ADVANCE", &format!("event=action input_index={} action={} sender={}",
+        input_index, action_type, msg_sender));
 
     match action_type.as_str() {
 
@@ -626,7 +736,6 @@ pub async fn handle_advance(
             let name = match action["name"].as_str() {
                 Some(n) if !n.is_empty() => n.to_string(),
                 _ => {
-                    log("ERROR", &format!("event=register_missing_name input_index={}", input_index));
                     emit_report(client, server_addr,
                         &format!(r#"{{"error":"register_missing_name","input_index":{}}}"#, input_index)).await?;
                     return Ok("reject");
@@ -635,7 +744,6 @@ pub async fn handle_advance(
             let reg_number = match action["reg_number"].as_str() {
                 Some(r) if !r.is_empty() => r.to_string(),
                 _ => {
-                    log("ERROR", &format!("event=register_missing_reg_number input_index={}", input_index));
                     emit_report(client, server_addr,
                         &format!(r#"{{"error":"register_missing_reg_number","input_index":{}}}"#, input_index)).await?;
                     return Ok("reject");
@@ -646,7 +754,6 @@ pub async fn handle_advance(
             let already = { get_state().lock().unwrap().students.contains_key(&wallet) };
 
             if already {
-                log("ERROR", &format!("event=already_registered input_index={} wallet={}", input_index, wallet));
                 emit_report(client, server_addr,
                     &format!(r#"{{"error":"already_registered","input_index":{},"wallet":"{}"}}"#,
                         input_index, wallet)).await?;
@@ -669,22 +776,16 @@ pub async fn handle_advance(
                 input_index, name, reg_number, wallet
             );
             emit_notice(client, server_addr, &notice).await?;
+            emit_advance_report("accept").await;
             Ok("accept")
         }
 
         // ── withdraw ─────────────────────────────────────────────────────────
-        // Payload schema:
-        //   { "action":"withdraw", "asset_type":"erc20"|"erc721"|"erc1155",
-        //     "token":"0x...",
-        //     "amount":"N"      (erc20 / erc1155),
-        //     "token_id":"0x..."(erc721 / erc1155) }
         "withdraw" => {
             let wallet = msg_sender.clone();
 
-            // Sender must be a registered student (or auto-registered depositor).
             let is_registered = { get_state().lock().unwrap().students.contains_key(&wallet) };
             if !is_registered {
-                log("ERROR", &format!("event=withdraw_not_registered input_index={} wallet={}", input_index, wallet));
                 emit_report(client, server_addr,
                     &format!(r#"{{"error":"not_registered","input_index":{},"wallet":"{}"}}"#,
                         input_index, wallet)).await?;
@@ -692,17 +793,7 @@ pub async fn handle_advance(
             }
 
             let asset_type = action["asset_type"].as_str().unwrap_or("").to_string();
-            let token = match action["token"].as_str() {
-                Some(t) if !t.is_empty() => t.to_lowercase(),
-                _ => {
-                    log("ERROR", &format!("event=withdraw_missing_token input_index={}", input_index));
-                    emit_report(client, server_addr,
-                        &format!(r#"{{"error":"withdraw_missing_token","input_index":{}}}"#, input_index)).await?;
-                    return Ok("reject");
-                }
-            };
-
-            // Fetch the app contract address needed for ERC-721/ERC-1155 vouchers.
+            let ether_portal_addr = { get_state().lock().unwrap().ether_portal.clone() };
             let app_addr = {
                 let s = get_state().lock().unwrap();
                 s.app_contract.clone().unwrap_or_default()
@@ -710,13 +801,70 @@ pub async fn handle_advance(
 
             match asset_type.as_str() {
 
-                // ── ERC-20 withdrawal ─────────────────────────────────────────
-                "erc20" => {
+                // ── Ether withdrawal ──────────────────────────────────────────
+                "ether" => {
                     let amount_str = action["amount"].as_str().unwrap_or("0");
                     let amount: u128 = match amount_str.parse() {
                         Ok(a) if a > 0 => a,
                         _ => {
-                            log("ERROR", &format!("event=withdraw_invalid_amount input_index={} raw={}", input_index, amount_str));
+                            emit_report(client, server_addr,
+                                &format!(r#"{{"error":"withdraw_invalid_amount","input_index":{},"raw":"{}"}}"#,
+                                    input_index, amount_str)).await?;
+                            return Ok("reject");
+                        }
+                    };
+
+                    let available = {
+                        let s = get_state().lock().unwrap();
+                        s.students.get(&wallet).map(|st| st.ether_available()).unwrap_or(0)
+                    };
+
+                    if available < amount {
+                        emit_report(client, server_addr, &format!(
+                            r#"{{"error":"insufficient_ether_balance","input_index":{},"wallet":"{}","available":"{}","requested":"{}"}}"#,
+                            input_index, wallet, available, amount
+                        )).await?;
+                        return Ok("reject");
+                    }
+
+                    {
+                        let mut s = get_state().lock().unwrap();
+                        if let Some(st) = s.students.get_mut(&wallet) {
+                            st.ether_withdrawals.push(amount);
+                        }
+                    }
+
+                    // withdrawEther(address receiver, uint256 value) on EtherPortal
+                    let calldata = calldata_ether_withdraw(&wallet, amount);
+                    log("ADVANCE", &format!(
+                        "event=ether_withdrawal input_index={} wallet={} amount={}",
+                        input_index, wallet, amount
+                    ));
+                    emit_voucher(client, server_addr, &ether_portal_addr, &calldata).await?;
+
+                    let notice = format!(
+                        r#"{{"event":"ether_withdrawal","input_index":{},"wallet":"{}","amount":"{}"}}"#,
+                        input_index, wallet, amount
+                    );
+                    emit_notice(client, server_addr, &notice).await?;
+                    emit_advance_report("accept").await;
+                    Ok("accept")
+                }
+
+                // ── ERC-20 withdrawal ─────────────────────────────────────────
+                "erc20" => {
+                    let token = match action["token"].as_str() {
+                        Some(t) if !t.is_empty() => t.to_lowercase(),
+                        _ => {
+                            emit_report(client, server_addr,
+                                &format!(r#"{{"error":"withdraw_missing_token","input_index":{}}}"#, input_index)).await?;
+                            return Ok("reject");
+                        }
+                    };
+                    let amount_str = action["amount"].as_str().unwrap_or("0");
+                    let amount: u128 = match amount_str.parse() {
+                        Ok(a) if a > 0 => a,
+                        _ => {
                             emit_report(client, server_addr,
                                 &format!(r#"{{"error":"withdraw_invalid_amount","input_index":{},"raw":"{}"}}"#,
                                     input_index, amount_str)).await?;
@@ -730,10 +878,6 @@ pub async fn handle_advance(
                     };
 
                     if available < amount {
-                        log("ERROR", &format!(
-                            "event=withdraw_insufficient_balance input_index={} wallet={} token={} available={} requested={}",
-                            input_index, wallet, token, available, amount
-                        ));
                         emit_report(client, server_addr, &format!(
                             r#"{{"error":"insufficient_erc20_balance","input_index":{},"wallet":"{}","token":"{}","available":"{}","requested":"{}"}}"#,
                             input_index, wallet, token, available, amount
@@ -741,7 +885,6 @@ pub async fn handle_advance(
                         return Ok("reject");
                     }
 
-                    // Record the withdrawal before emitting voucher.
                     {
                         let mut s = get_state().lock().unwrap();
                         if let Some(st) = s.students.get_mut(&wallet) {
@@ -750,10 +893,6 @@ pub async fn handle_advance(
                     }
 
                     let calldata = calldata_erc20_transfer(&wallet, amount);
-                    log("ADVANCE", &format!(
-                        "event=erc20_withdrawal input_index={} wallet={} token={} amount={} calldata={}",
-                        input_index, wallet, token, amount, calldata
-                    ));
                     emit_voucher(client, server_addr, &token, &calldata).await?;
 
                     let notice = format!(
@@ -761,15 +900,23 @@ pub async fn handle_advance(
                         input_index, wallet, token, amount
                     );
                     emit_notice(client, server_addr, &notice).await?;
+                    emit_advance_report("accept").await;
                     Ok("accept")
                 }
 
                 // ── ERC-721 withdrawal ────────────────────────────────────────
                 "erc721" => {
+                    let token = match action["token"].as_str() {
+                        Some(t) if !t.is_empty() => t.to_lowercase(),
+                        _ => {
+                            emit_report(client, server_addr,
+                                &format!(r#"{{"error":"withdraw_missing_token","input_index":{}}}"#, input_index)).await?;
+                            return Ok("reject");
+                        }
+                    };
                     let token_id_raw = match action["token_id"].as_str() {
                         Some(id) if !id.is_empty() => id.to_string(),
                         _ => {
-                            log("ERROR", &format!("event=withdraw_missing_token_id input_index={}", input_index));
                             emit_report(client, server_addr,
                                 &format!(r#"{{"error":"withdraw_missing_token_id","input_index":{}}}"#, input_index)).await?;
                             return Ok("reject");
@@ -785,10 +932,6 @@ pub async fn handle_advance(
                     };
 
                     if !has_token {
-                        log("ERROR", &format!(
-                            "event=withdraw_token_not_held input_index={} wallet={} token={} token_id={}",
-                            input_index, wallet, token, token_id
-                        ));
                         emit_report(client, server_addr, &format!(
                             r#"{{"error":"erc721_token_not_held","input_index":{},"wallet":"{}","token":"{}","token_id":"{}"}}"#,
                             input_index, wallet, token, token_id
@@ -797,10 +940,8 @@ pub async fn handle_advance(
                     }
 
                     if app_addr.is_empty() {
-                        log("ERROR", &format!("event=app_contract_unknown input_index={}", input_index));
                         emit_report(client, server_addr, &format!(
-                            r#"{{"error":"app_contract_unknown","hint":"app address is self-discovered — ensure at least one advance input was processed before withdrawing","input_index":{}}}"#,
-                            input_index
+                            r#"{{"error":"app_contract_unknown","input_index":{}}}"#, input_index
                         )).await?;
                         return Ok("reject");
                     }
@@ -813,10 +954,6 @@ pub async fn handle_advance(
                     }
 
                     let calldata = calldata_erc721_transfer(&app_addr, &wallet, &token_id);
-                    log("ADVANCE", &format!(
-                        "event=erc721_withdrawal input_index={} wallet={} token={} token_id={} from={} calldata={}",
-                        input_index, wallet, token, token_id, app_addr, calldata
-                    ));
                     emit_voucher(client, server_addr, &token, &calldata).await?;
 
                     let notice = format!(
@@ -824,15 +961,23 @@ pub async fn handle_advance(
                         input_index, wallet, token, token_id
                     );
                     emit_notice(client, server_addr, &notice).await?;
+                    emit_advance_report("accept").await;
                     Ok("accept")
                 }
 
                 // ── ERC-1155 withdrawal ───────────────────────────────────────
                 "erc1155" => {
+                    let token = match action["token"].as_str() {
+                        Some(t) if !t.is_empty() => t.to_lowercase(),
+                        _ => {
+                            emit_report(client, server_addr,
+                                &format!(r#"{{"error":"withdraw_missing_token","input_index":{}}}"#, input_index)).await?;
+                            return Ok("reject");
+                        }
+                    };
                     let token_id_raw = match action["token_id"].as_str() {
                         Some(id) if !id.is_empty() => id.to_string(),
                         _ => {
-                            log("ERROR", &format!("event=withdraw_missing_token_id input_index={}", input_index));
                             emit_report(client, server_addr,
                                 &format!(r#"{{"error":"withdraw_missing_token_id","input_index":{}}}"#, input_index)).await?;
                             return Ok("reject");
@@ -844,7 +989,6 @@ pub async fn handle_advance(
                     let amount: u128 = match amount_str.parse() {
                         Ok(a) if a > 0 => a,
                         _ => {
-                            log("ERROR", &format!("event=withdraw_invalid_amount input_index={} raw={}", input_index, amount_str));
                             emit_report(client, server_addr,
                                 &format!(r#"{{"error":"withdraw_invalid_amount","input_index":{},"raw":"{}"}}"#,
                                     input_index, amount_str)).await?;
@@ -860,10 +1004,6 @@ pub async fn handle_advance(
                     };
 
                     if available < amount {
-                        log("ERROR", &format!(
-                            "event=withdraw_insufficient_balance input_index={} wallet={} token={} token_id={} available={} requested={}",
-                            input_index, wallet, token, token_id, available, amount
-                        ));
                         emit_report(client, server_addr, &format!(
                             r#"{{"error":"insufficient_erc1155_balance","input_index":{},"wallet":"{}","token":"{}","token_id":"{}","available":"{}","requested":"{}"}}"#,
                             input_index, wallet, token, token_id, available, amount
@@ -872,7 +1012,6 @@ pub async fn handle_advance(
                     }
 
                     if app_addr.is_empty() {
-                        log("ERROR", &format!("event=app_contract_unknown input_index={}", input_index));
                         emit_report(client, server_addr, &format!(
                             r#"{{"error":"app_contract_unknown","input_index":{}}}"#, input_index
                         )).await?;
@@ -887,10 +1026,6 @@ pub async fn handle_advance(
                     }
 
                     let calldata = calldata_erc1155_transfer(&app_addr, &wallet, &token_id, amount);
-                    log("ADVANCE", &format!(
-                        "event=erc1155_withdrawal input_index={} wallet={} token={} token_id={} amount={} calldata={}",
-                        input_index, wallet, token, token_id, amount, calldata
-                    ));
                     emit_voucher(client, server_addr, &token, &calldata).await?;
 
                     let notice = format!(
@@ -898,13 +1033,13 @@ pub async fn handle_advance(
                         input_index, wallet, token, token_id, amount
                     );
                     emit_notice(client, server_addr, &notice).await?;
+                    emit_advance_report("accept").await;
                     Ok("accept")
                 }
 
                 _ => {
-                    log("ERROR", &format!("event=withdraw_unknown_asset_type input_index={} asset_type={}", input_index, asset_type));
                     emit_report(client, server_addr, &format!(
-                        r#"{{"error":"unknown_asset_type","input_index":{},"asset_type":"{}","valid":["erc20","erc721","erc1155"]}}"#,
+                        r#"{{"error":"unknown_asset_type","input_index":{},"asset_type":"{}","valid":["ether","erc20","erc721","erc1155"]}}"#,
                         input_index, asset_type
                     )).await?;
                     Ok("reject")
@@ -912,11 +1047,41 @@ pub async fn handle_advance(
             }
         }
 
+        // ── ping ─────────────────────────────────────────────────────────────
+        "ping" => {
+            log("ADVANCE", &format!("event=ping input_index={} sender={}", input_index, msg_sender));
+            let notice = format!(
+                r#"{{"event":"pong","input_index":{},"sender":"{}"}}"#,
+                input_index, msg_sender
+            );
+            emit_notice(client, server_addr, &notice).await?;
+            emit_advance_report("accept").await;
+            Ok("accept")
+        }
+
+        // ── dapp-address relay ────────────────────────────────────────────────
+        "dapp_address" | "dapp-address" => {
+            let addr = action["address"].as_str().unwrap_or(&msg_sender).to_string();
+            {
+                let mut s = get_state().lock().unwrap();
+                if s.app_contract.is_none() {
+                    s.app_contract = Some(addr.clone());
+                }
+            }
+            let notice = format!(
+                r#"{{"event":"dapp_address_relay","input_index":{},"address":"{}"}}"#,
+                input_index, addr
+            );
+            emit_notice(client, server_addr, &notice).await?;
+            emit_advance_report("accept").await;
+            Ok("accept")
+        }
+
         // ── unknown action ────────────────────────────────────────────────────
         other => {
             log("ERROR", &format!("event=unknown_action input_index={} action={}", input_index, other));
             emit_report(client, server_addr, &format!(
-                r#"{{"error":"unknown_action","input_index":{},"action":"{}","valid":["register","withdraw"]}}"#,
+                r#"{{"error":"unknown_action","input_index":{},"action":"{}","valid":["ping","register","withdraw"]}}"#,
                 input_index, other
             )).await?;
             Ok("reject")
@@ -927,11 +1092,13 @@ pub async fn handle_advance(
 // ═══════════════════════════════════════════════════════════════════════════════
 // Inspect handler
 // Routes (raw UTF-8 POST body / hex-decoded):
-//   ""  | "all"           — all students with full balances
-//   "student/<addr>"      — single student full state
-//   "activity/<addr>"     — deposit + withdrawal history for a student
-//   "portals"             — configured portal and app contract addresses
-//   "summary"             — total counts only
+//   "" | "all"              — all students with full balances
+//   "student/<addr>"        — single student full state
+//   "activity/<addr>"       — deposit + withdrawal history for a student
+//   "portals"               — configured portal and app contract addresses
+//   "summary"               — total counts only
+//   "app"                   — app contract address
+//   "status"                — app health / version / counters
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub async fn handle_inspect(
@@ -985,11 +1152,12 @@ pub async fn handle_inspect(
     } else if route == "portals" {
         let s = get_state().lock().unwrap();
         object!{
-            "route"          => "portals",
-            "erc20_portal"   => s.erc20_portal.clone(),
-            "erc721_portal"  => s.erc721_portal.clone(),
-            "erc1155_portal" => s.erc1155_portal.clone(),
-            "app_contract"   => s.app_contract.clone().unwrap_or_default(),
+            "route"           => "portals",
+            "ether_portal"    => s.ether_portal.clone(),
+            "erc20_portal"    => s.erc20_portal.clone(),
+            "erc721_portal"   => s.erc721_portal.clone(),
+            "erc1155_portal"  => s.erc1155_portal.clone(),
+            "app_contract"    => s.app_contract.clone().unwrap_or_default(),
         }.dump()
 
     } else if route == "summary" {
@@ -997,6 +1165,7 @@ pub async fn handle_inspect(
         let total = s.students.len();
         let registered = s.students.values().filter(|st| !st.name.starts_with("Unknown(")).count();
         let auto = total - registered;
+        let ether_deps: usize  = s.students.values().map(|st| st.ether_deposits.len()).sum();
         let erc20_deps: usize  = s.students.values().map(|st| st.erc20_deposits.len()).sum();
         let erc721_deps: usize = s.students.values().map(|st| st.erc721_deposits.len()).sum();
         let erc1155_deps: usize = s.students.values().map(|st| st.erc1155_deposits.len()).sum();
@@ -1008,6 +1177,7 @@ pub async fn handle_inspect(
             "total_students"     => total,
             "registered"         => registered,
             "auto_registered"    => auto,
+            "ether_deposits"     => ether_deps,
             "erc20_deposits"     => erc20_deps,
             "erc721_deposits"    => erc721_deps,
             "erc1155_deposits"   => erc1155_deps,
@@ -1032,31 +1202,51 @@ pub async fn handle_inspect(
             }.dump(),
         }
 
+    } else if route == "status" || route == "health" {
+        let s = get_state().lock().unwrap();
+        object!{
+            "route"           => "status",
+            "status"          => "ok",
+            "app_name"        => "student-tracker",
+            "version"         => APP_VERSION,
+            "total_students"  => s.students.len(),
+            "total_inputs"    => s.total_inputs,
+            "total_notices"   => s.total_notices,
+            "total_vouchers"  => s.total_vouchers,
+            "portals_configured" => object!{
+                "ether"   => !s.ether_portal.is_empty(),
+                "erc20"   => !s.erc20_portal.is_empty(),
+                "erc721"  => !s.erc721_portal.is_empty(),
+                "erc1155" => !s.erc1155_portal.is_empty(),
+            },
+        }.dump()
+
     } else {
-        format!(r#"{{"error":"unknown_route","route":"{}","valid":["all","student/<addr>","activity/<addr>","portals","app","summary"]}}"#, route)
+        format!(
+            r#"{{"error":"unknown_route","route":"{}","valid":["all","student/<addr>","activity/<addr>","portals","app","summary","status"]}}"#,
+            route
+        )
     };
 
-    log("INSPECT", &format!("event=inspect_response route={} response_len={}", route, report.len()));
+    log("INSPECT", &format!("event=inspect_response route={} len={}", route, report.len()));
     emit_report(client, server_addr, &report).await?;
     Ok("accept")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Main — finish loop
+// Main loop
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load .env before anything else so portal addresses are available.
     load_dotenv();
 
     let client = hyper::Client::new();
     let server_addr = env::var("ROLLUP_HTTP_SERVER_URL")?;
 
-    log("INIT", &format!("event=startup rollup_server={}", server_addr));
+    log("INIT", &format!("event=startup rollup_server={} version={}", server_addr, APP_VERSION));
 
-    // Eagerly initialise state (reads portal env vars and prints config).
-    get_state();
+    get_state();  // eagerly initialise (reads portal env vars)
 
     let mut status = "accept";
     loop {
@@ -1070,10 +1260,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let response = client.request(request).await?;
         let http_status = response.status();
 
-        log("FINISH", &format!("event=finish_response http_status={} prev_status={}", http_status, status));
+        log("FINISH", &format!("event=finish http_status={} prev_status={}", http_status, status));
 
         if http_status == hyper::StatusCode::ACCEPTED {
-            // No pending input — loop again immediately.
+            // No pending input
         } else {
             let body = hyper::body::to_bytes(response).await?;
             let utf  = std::str::from_utf8(&body)?;
